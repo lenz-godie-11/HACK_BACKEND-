@@ -3,6 +3,7 @@ import pandas as pd
 
 from pipeline.config.settings import (
     INTERPOLATION_METHOD,
+    MAX_INTERPOLATION_GAP_DAYS,
     PIPELINE_FREQUENCY,
     WINSOR_LOWER_IQR_MULTIPLIER,
     WINSOR_UPPER_IQR_MULTIPLIER,
@@ -40,13 +41,51 @@ def reindex_calendar(df: pd.DataFrame) -> pd.DataFrame:
     return data
 
 
-def interpolate_missing(df: pd.DataFrame) -> pd.DataFrame:
-    """Fill gaps left by reindexing with linear interpolation."""
-    data = df.copy()
+def _detect_gaps(series: pd.Series) -> list[tuple[pd.Timestamp, pd.Timestamp, int]]:
+    """Detect consecutive NaN gaps in a series.
 
-    data["patients"] = data["patients"].interpolate(
-        method=INTERPOLATION_METHOD
-    )
+    Returns list of (gap_start, gap_end, gap_length) for each gap.
+    """
+    isnan = series.isna()
+    if not isnan.any():
+        return []
+
+    # Find consecutive NaN blocks
+    gap_starts = isnan & ~isnan.shift(1, fill_value=False)
+    gap_ends = isnan & ~isnan.shift(-1, fill_value=False)
+
+    starts = series.index[gap_starts]
+    ends = series.index[gap_ends]
+
+    gaps = []
+    for start, end in zip(starts, ends):
+        gap_length = (end - start).days + 1
+        gaps.append((start, end, gap_length))
+
+    return gaps
+
+
+def interpolate_missing(df: pd.DataFrame) -> pd.DataFrame:
+    """Fill small gaps left by reindexing with linear interpolation.
+
+    Gaps larger than MAX_INTERPOLATION_GAP_DAYS are not interpolated and
+    cause a ValueError to be raised.
+    """
+    data = df.copy()
+    patients = data["patients"]
+
+    gaps = _detect_gaps(patients)
+
+    for gap_start, gap_end, gap_length in gaps:
+        if gap_length > MAX_INTERPOLATION_GAP_DAYS:
+            raise ValueError(
+                f"Gap of {gap_length} days from {gap_start.date()} to {gap_end.date()} "
+                f"exceeds maximum interpolation threshold of {MAX_INTERPOLATION_GAP_DAYS} days. "
+                f"History contains discontinuity too large for reliable forecasting."
+            )
+
+    # All gaps are within threshold, safe to interpolate
+    data["patients"] = patients.interpolate(method=INTERPOLATION_METHOD)
 
     return data
 
